@@ -1,0 +1,35 @@
+# Render Blueprint - deploys the webhook bot as a free Web Service.
+# In Render Dashboard: New > Blueprint, pick your repo, or
+# New > Web Service > Build and deploy from a Git repository,
+# then paste the values below manually.
+#
+# Start command (Render Dashboard > Settings):
+#   gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+#
+# Free plan notes:
+# - Instance sleeps after 15 min with no traffic, wakes on next webhook.
+# - First reply after sleep can take 30-50s. Telegram will wait.
+# - 750 free hours/month - enough for one service running all month,
+#   because sleep time still counts as uptime in Render's free plan.
+#   If you add a second free service, watch the 750h total.
+services:
+  - type: web
+    name: telegram-image-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: CF_ACCOUNT_ID
+        sync: false
+      - key: CF_API_TOKEN
+        sync: false
+      - key: DAILY_TXT_LIMIT
+        value: "5"
+      - key: DAILY_EDIT_LIMIT
+        value: "3"
+      - key: WEBHOOK_SECRET
+        generateValue: true
+    healthCheckPath: /
