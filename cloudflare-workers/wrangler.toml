@@ -1,0 +1,34 @@
+name = "telegram-image-bot"
+main = "src/index.js"
+compatibility_date = "2026-11-13"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers AI - no API token needed inside the Worker, the binding
+# calls FLUX directly on your Cloudflare account.
+[ai]
+binding = "AI"
+
+# Queue - webhook enqueues, consumer draws the picture.
+# Create it first: npx wrangler queues create telegram-image-jobs
+[[queues.producers]]
+binding = "IMAGE_QUEUE"
+queue = "telegram-image-jobs"
+
+[[queues.consumers]]
+queue = "telegram-image-jobs"
+max_batch_size = 1
+max_retries = 2
+dead_letter_queue = "telegram-image-jobs-dlq"
+
+# KV - per-user caps + shared Neuron count. Optional but recommended.
+# Create it first: npx wrangler kv namespace create USAGE_KV
+# Then paste the id it prints below, replacing PLACEHOLDER.
+# If you skip KV, caps are disabled and the bot still works.
+[[kv_namespaces]]
+binding = "USAGE_KV"
+id = "PLACEHOLDER_KV_ID"
+
+[vars]
+DAILY_TXT_LIMIT = "5"
+DAILY_EDIT_LIMIT = "3"
+# WEBHOOK_SECRET = "set this as a secret instead, see README"

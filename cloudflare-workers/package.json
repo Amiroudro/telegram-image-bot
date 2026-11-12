@@ -1,0 +1,1 @@
+{"devDependencies":{"wrangler":"^4.0.0"},"name":"telegram-image-bot-worker","private":true,"scripts":{"deploy":"wrangler deploy","dev":"wrangler dev","kv:create":"wrangler kv namespace create USAGE_KV","queue:create":"wrangler queues create telegram-image-jobs"},"version":"1.0.0"}
