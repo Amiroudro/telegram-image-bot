@@ -1,5 +1,6 @@
 """
-Telegram image bot - Cloudflare Workers AI (FLUX), free tier.
+Telegram image bot - Cloudflare Workers AI (FLUX), free tier,
+with automatic fallback to Pollinations and AI Horde.
 
 Text-to-image:  /imagine a red fox in fresh snow
                 or just send the prompt as a plain message
@@ -10,10 +11,17 @@ Image-to-image: send a photo WITH a caption describing the edit,
 
 Commands: /start /help /imagine <prompt> /edit <prompt> (reply to photo) /status
 
-Free limits (Cloudflare, Nov 2026):
-- 10,000 Neurons/day, shared across all users, resets 00:00 UTC, no card.
-- ~173 text pictures/day at 1024x1024, ~91 edits/day at 1024x1024.
-- Per-user caps in this bot: 5 pictures + 3 edits per day (change in .env).
+Free limits (Nov 2026):
+- Cloudflare (primary): 10,000 Neurons/day, shared across all users,
+  resets 00:00 UTC, no card. ~173 text pictures/day at 1024x1024,
+  ~91 edits/day at 1024x1024.
+- If Cloudflare fails or its quota runs out, the bot automatically
+  tries Pollinations (no key, slow, ~768x768) then AI Horde
+  (anonymous, queue-based, 512x512). No new keys needed.
+  Edits stay Cloudflare-only - the fallbacks draw new pictures.
+- Per-user caps in this bot: 5 pictures + 3 edits per day (change
+  in .env). Only a DELIVERED picture counts - a failed attempt
+  does not eat your daily allowance.
 
 Setup: copy .env.example to .env, fill in the 3 values, then:
     pip install -r requirements.txt
@@ -42,7 +50,7 @@ from telegram.ext import (
 )
 
 import cloudflare
-import pollinations
+import providers
 from usage import UsageStore
 
 load_dotenv()
@@ -93,8 +101,10 @@ async def do_text_to_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("That prompt is too long - keep it under 2000 characters.")
         return
 
-    allowed, reason, txt_used, _ = usage.check_and_count(
-        user.id, "txt", TXT_LIMIT, EDIT_LIMIT, cloudflare.NEURONS_SCHNELL_1024
+    # Check the cap first, but only COUNT a picture that is actually
+    # delivered (providers.py returns only on success).
+    allowed, reason, txt_used, _ = usage.check(
+        user.id, "txt", TXT_LIMIT, EDIT_LIMIT
     )
     if not allowed:
         await update.message.reply_text(reason)
@@ -104,47 +114,32 @@ async def do_text_to_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"Drawing it... ({txt_used}/{TXT_LIMIT} pictures used today)"
     )
     try:
-        account_id, token = cloudflare.env_config()
-        image_bytes, neurons = await asyncio.to_thread(
-            cloudflare.text_to_image, account_id, token, prompt
-        )
-        usage.add_neurons(neurons)
-        await wait.delete()
-        await send_photo_bytes(
-            update, image_bytes,
-            f"“{prompt}”\nFLUX.1-schnell • 1024×1024 • ~{neurons:.1f} Neurons",
+        image_bytes, label, neurons = await asyncio.to_thread(
+            providers.generate_text_image, prompt
         )
     except Exception as e:
         await wait.delete()
-        log.exception("txt2img failed")
-        msg = str(e)
-        # Optional Pollinations fallback, only if a key is configured.
-        if "429" in msg or "used up" in msg.lower():
-            if pollinations.is_configured():
-                try:
-                    await update.message.reply_text(
-                        "Cloudflare free quota is used up - trying the Pollinations fallback..."
-                    )
-                    image_bytes = await asyncio.to_thread(
-                        pollinations.text_to_image, prompt
-                    )
-                    await send_photo_bytes(
-                        update, image_bytes,
-                        f"“{prompt}”\nPollinations fallback • flux",
-                    )
-                    return
-                except Exception:
-                    log.exception("Pollinations fallback failed")
-            await update.message.reply_text(
-                "Today's free Cloudflare quota is used up for everyone. "
-                "Try again after 00:00 UTC.\n\n"
-                "If this keeps happening, the fix is a per-user cap (already on: "
-                f"{TXT_LIMIT} pictures/day) or a small paid top-up - see README."
-            )
-            return
+        log.exception("txt2img failed on all engines")
         await update.message.reply_text(
-            f"Sorry, that picture failed: {msg}\nTry a simpler prompt, or try again in a minute."
+            "Sorry, all three picture engines failed right now:\n"
+            f"{str(e)}\n"
+            "Nothing was counted against your daily limit - try again in a bit."
         )
+        return
+    # Delivered: now it counts.
+    txt_used, _ = usage.count(user.id, "txt")
+    if neurons is not None:
+        usage.add_neurons(neurons)
+    await wait.delete()
+    if label == providers.LABEL_CLOUDFLARE:
+        caption = (f"“{prompt}”\nFLUX.1-schnell • 1024×1024 • ~{neurons:.1f} Neurons")
+    elif label == providers.LABEL_POLLINATIONS:
+        caption = (f"“{prompt}”\nvia Pollinations (fallback) — Cloudflare was "
+                   "unavailable • 768×768")
+    else:
+        caption = (f"“{prompt}”\nvia AI Horde (fallback) — Cloudflare was "
+                   "unavailable • 512×512")
+    await send_photo_bytes(update, image_bytes, caption)
 
 
 async def do_image_to_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -155,8 +150,10 @@ async def do_image_to_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("Tell me how to change the photo, e.g. “make it sunset”.")
         return
 
-    allowed, reason, _, edits_used = usage.check_and_count(
-        user.id, "edit", TXT_LIMIT, EDIT_LIMIT, cloudflare.NEURONS_KLEIN_EDIT_1024
+    # Check the cap first, but only COUNT an edit that is actually
+    # delivered (see the try block below).
+    allowed, reason, _, edits_used = usage.check(
+        user.id, "edit", TXT_LIMIT, EDIT_LIMIT
     )
     if not allowed:
         await update.message.reply_text(reason)
@@ -173,28 +170,26 @@ async def do_image_to_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
         image_bytes, neurons = await asyncio.to_thread(
             cloudflare.image_to_image, account_id, token, prompt, resized
         )
-        usage.add_neurons(neurons)
-        await wait.delete()
-        await send_photo_bytes(
-            update, image_bytes,
-            f"Edited: “{prompt}”\nFLUX.2-klein-4b • 1024×1024 • ~{neurons:.1f} Neurons",
-        )
     except Exception as e:
         await wait.delete()
         log.exception("img2img failed")
         msg = str(e)
-        if "429" in msg or "used up" in msg.lower():
-            await update.message.reply_text(
-                "Today's free Cloudflare quota is used up for everyone. "
-                "Try again after 00:00 UTC."
-            )
-            return
         await update.message.reply_text(
-            "Sorry, that edit failed. Two things to check:\n"
-            "1. The photo must be under 512×512 for the input - the bot resizes it, but a very small or odd photo can still fail.\n"
-            f"2. Cloudflare said: {msg}\n"
-            "Try again with a clear photo and a simple edit prompt."
+            "Sorry, that edit failed - edits only work on Cloudflare, "
+            "and the Pollinations / AI Horde fallbacks only draw new "
+            "pictures, they can't edit one.\n"
+            f"Cloudflare said: {msg}\n"
+            "Nothing was counted against your daily edits - try again in a bit."
         )
+        return
+    # Delivered: now it counts.
+    _, edits_used = usage.count(user.id, "edit")
+    usage.add_neurons(neurons)
+    await wait.delete()
+    await send_photo_bytes(
+        update, image_bytes,
+        f"Edited: “{prompt}”\nFLUX.2-klein-4b • 1024×1024 • ~{neurons:.1f} Neurons",
+    )
 
 
 # --- Handlers ---
@@ -209,6 +204,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Or send a photo, then send the edit prompt next.\n\n"
         f"Free limits: {TXT_LIMIT} pictures + {EDIT_LIMIT} edits per person per day, "
         "shared Cloudflare quota resets 00:00 UTC.\n"
+        "If Cloudflare is down or out of quota, I automatically try "
+        "Pollinations, then AI Horde - no key needed.\n"
         "Use /status to see what you have left, /help for examples."
     )
 
@@ -223,6 +220,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/edit make the sky stormy\n"
         "→ reply to a photo with this, same as a captioned photo.\n\n"
         "/status → your pictures/edits used today + free quota left.\n\n"
+        "If Cloudflare fails or its daily quota runs out, I automatically "
+        "fall back to Pollinations, then AI Horde - the picture just takes "
+        "a bit longer and comes back smaller. Edits always need Cloudflare.\n\n"
         "Good prompts name the subject, place, light and style. "
         "Edits work best for style, background and light - not for tiny text."
     )
@@ -250,7 +250,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Today ({s['day']}, UTC):\n"
         f"• You: {s['txt_used']}/{s['txt_limit']} pictures, {s['edits_used']}/{s['edit_limit']} edits\n"
         f"• Shared free quota: ~{s['neurons_left']:.0f} of {s['neurons_budget']:.0f} Neurons left\n"
-        "Quota resets 00:00 UTC."
+        "Quota resets 00:00 UTC.\n"
+        "Engines: Cloudflare FLUX (primary) • Pollinations + AI Horde "
+        "fallbacks (no key needed, slower/smaller)."
     )
 
 
@@ -284,9 +286,12 @@ def main():
             "Missing TELEGRAM_BOT_TOKEN. Copy .env.example to .env and "
             "paste the token from @BotFather - see README.md."
         )
-    # Fail fast if Cloudflare is not configured, instead of failing
-    # on the first picture.
-    cloudflare.env_config()
+    # Cloudflare is the primary engine, but the bot can still run on
+    # the keyless fallbacks alone - warn instead of exiting.
+    try:
+        cloudflare.env_config()
+    except RuntimeError as e:
+        log.warning("Cloudflare not configured (%s) - running on Pollinations / AI Horde fallbacks only.", e)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))

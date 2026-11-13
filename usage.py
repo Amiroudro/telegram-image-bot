@@ -44,15 +44,20 @@ class UsageStore:
                 " day TEXT PRIMARY KEY, neurons REAL DEFAULT 0)"
             )
 
-    def check_and_count(self, user_id: int, kind: str,
-                        txt_limit: int, edit_limit: int,
-                        neurons_cost: float) -> tuple[bool, str, int, int]:
+    def check(self, user_id: int, kind: str,
+              txt_limit: int, edit_limit: int) -> tuple[bool, str, int, int]:
         """
-        Check caps BEFORE calling Cloudflare, then count the attempt.
+        Check per-user caps WITHOUT counting anything.
         kind is 'txt' or 'edit'.
         Returns (allowed, reason, used_txt_today, used_edits_today).
-        The neuron cost is only added by add_neurons() AFTER a
-        successful generation, so a failed call does not eat budget.
+        Call count() only AFTER a picture/edit is actually delivered -
+        a failed attempt must not eat the user's daily allowance.
+
+        NOTE: the shared Neuron budget is deliberately NOT a blocker
+        here. When Cloudflare's 10,000 Neurons are spent, the
+        provider chain falls back to Pollinations / AI Horde, which
+        do not use Neurons. The budget is still tracked (add_neurons)
+        and shown in /status.
         """
         day = today_utc()
         with self._connect() as con:
@@ -66,14 +71,17 @@ class UsageStore:
                 return False, f"You used your {txt_limit} free pictures for today. Try again after 00:00 UTC.", txt_used, edits_used
             if kind == "edit" and edits_used >= edit_limit:
                 return False, f"You used your {edit_limit} free edits for today. Try again after 00:00 UTC.", txt_used, edits_used
+            return True, "", txt_used, edits_used
 
-            nrow = con.execute(
-                "SELECT neurons FROM neuron_usage WHERE day=?", (day,)
+    def count(self, user_id: int, kind: str) -> tuple[int, int]:
+        """Record one DELIVERED picture/edit. Returns (txt_used, edits_used)."""
+        day = today_utc()
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT txt, edits FROM daily_usage WHERE user_id=? AND day=?",
+                (user_id, day),
             ).fetchone()
-            neurons_used = nrow[0] if nrow else 0.0
-            if neurons_used + neurons_cost > DAILY_NEURON_BUDGET:
-                return False, "Today's free Cloudflare quota is used up for everyone. Try again after 00:00 UTC.", txt_used, edits_used
-
+            txt_used, edits_used = row if row else (0, 0)
             if kind == "txt":
                 txt_used += 1
             else:
@@ -83,7 +91,7 @@ class UsageStore:
                 "ON CONFLICT(user_id, day) DO UPDATE SET txt=excluded.txt, edits=excluded.edits",
                 (user_id, day, txt_used, edits_used),
             )
-            return True, "", txt_used, edits_used
+            return txt_used, edits_used
 
     def add_neurons(self, neurons_cost: float) -> None:
         day = today_utc()
